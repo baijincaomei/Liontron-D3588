@@ -1,0 +1,85 @@
+# .github/workflows/build-kernel.yml
+name: Build RK3588 Kernel with NPU 0.9.8
+
+on:
+  workflow_dispatch:  # 允许你手动触发编译
+
+env:
+  ARCH: arm64
+  KERNEL_SRC_DIR: kernel  # 内核源码存放的目录
+
+jobs:
+  build:
+    name: Build Kernel
+    # 关键点：使用 GitHub 官方的 ARM64 运行器进行原生编译
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: yifengyou/Liontron-D3588  # 替换成你的内核源码仓库
+          path: ${{ env.KERNEL_SRC_DIR }}
+
+      - name: Checkout NPU Driver Source
+        uses: actions/checkout@v4
+        with:
+          repository: 你的NPU驱动源码仓库地址  # 替换成存放 NPU 0.9.8 驱动的仓库
+          path: rknpu-driver-src
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          # 安装编译内核所需的所有工具
+          sudo apt-get install -y \
+            build-essential flex bison bc kmod cpio \
+            libssl-dev libelf-dev device-tree-compiler
+
+      - name: Replace NPU Driver
+        run: |
+          cd ${{ env.KERNEL_SRC_DIR }}
+          # 1. 备份原有驱动
+          cp -r drivers/rknpu drivers/rknpu_backup
+          # 2. 删除原有驱动，用 0.9.8 版本替换
+          rm -rf drivers/rknpu
+          cp -rf ../rknpu-driver-src/rknpu_driver_0.9.8/drivers/rknpu drivers/
+
+      # 这里需要你根据之前的讨论，添加那两处代码修改
+      - name: Apply Kernel Patches
+        run: |
+          cd ${{ env.KERNEL_SRC_DIR }}
+          # 示例：修改 rknpu_devfreq.c 文件
+          # sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
+          # 你可以将修改好的文件提前放在仓库的 patches/ 目录下，然后在这里用 patch 命令打上
+          # patch -p1 < ../patches/0001-add-vm_flags_set.patch
+
+      - name: Configure Kernel
+        run: |
+          cd ${{ env.KERNEL_SRC_DIR }}
+          # 使用你设备默认的配置，这很重要！
+          make rockchip_linux_defconfig
+          # 或者，如果你有更精确的配置文件，可以这样：
+          # cp ../.config .config
+          # make olddefconfig
+
+      - name: Build Kernel and Modules
+        run: |
+          cd ${{ env.KERNEL_SRC_DIR }}
+          # 开始编译，-j$(nproc) 表示使用所有CPU核心并行编译
+          make -j$(nproc)
+          make modules -j$(nproc)
+
+      - name: Package Kernel Artifacts
+        run: |
+          cd ${{ env.KERNEL_SRC_DIR }}
+          mkdir -p ../output
+          # 复制内核镜像和设备树文件
+          cp arch/arm64/boot/Image ../output/
+          cp arch/arm64/boot/dts/rockchip/*.dtb ../output/
+          # 打包内核模块
+          tar -czf ../output/modules.tar.gz lib/modules/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifacts
+          path: output/
