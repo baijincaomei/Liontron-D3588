@@ -7,7 +7,6 @@ on:
 env:
   ARCH: arm64
   CROSS_COMPILE: aarch64-linux-gnu-
-  # 选择要编译的内核版本，根据仓库结构，可选: kernel-5.10.198, kernel-6.6.y 等
   KERNEL_DIR: kernel-5.10.198
 
 jobs:
@@ -27,23 +26,57 @@ jobs:
           repository: airockchip/rknn-llm
           path: rknn-llm
 
-      - name: Extract and Prepare NPU Driver
+      - name: Extract NPU Driver
         run: |
           cd rknn-llm/rknpu-driver
+          # 解压驱动包
           tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
-          # 驱动源码解压后位于 rknpu_driver_0.9.8/drivers/rknpu/
-          ls -la rknpu_driver_0.9.8/drivers/
+          # 查看解压后的内容（调试用）
+          echo "=== 解压后的目录内容 ==="
+          ls -la
+          echo "=== 查找 rknpu 目录 ==="
+          find . -name "rknpu" -type d
+          echo "=== drivers 目录内容（如果存在）==="
+          ls -la drivers/ 2>/dev/null || echo "drivers 目录不存在"
 
       - name: Replace NPU Driver in Kernel
         run: |
           cd kernel-source/${{ env.KERNEL_DIR }}
-          # 1. 备份原有驱动（如果存在）
-          [ -d drivers/rknpu ] && cp -r drivers/rknpu drivers/rknpu_backup
-          # 2. 删除原有驱动
+          
+          # 确定新驱动的实际位置
+          # 情况1：解压后有 drivers/rknpu 目录
+          if [ -d "../../rknn-llm/rknpu-driver/drivers/rknpu" ]; then
+            NEW_DRIVER_PATH="../../rknn-llm/rknpu-driver/drivers/rknpu"
+          # 情况2：解压后当前目录就是驱动文件（有 rknpu_drv.c 等）
+          elif [ -f "../../rknn-llm/rknpu-driver/rknpu_drv.c" ]; then
+            echo "驱动文件直接位于解压目录，需要创建 rknpu 目录"
+            mkdir -p ../../rknn-llm/rknpu-driver/rknpu_temp
+            cp ../../rknn-llm/rknpu-driver/*.c ../../rknn-llm/rknpu-driver/rknpu_temp/ 2>/dev/null
+            cp ../../rknn-llm/rknpu-driver/*.h ../../rknn-llm/rknpu-driver/rknpu_temp/ 2>/dev/null
+            cp ../../rknn-llm/rknpu-driver/Makefile ../../rknn-llm/rknpu-driver/rknpu_temp/ 2>/dev/null
+            cp ../../rknn-llm/rknpu-driver/Kconfig ../../rknn-llm/rknpu-driver/rknpu_temp/ 2>/dev/null
+            cp -r ../../rknn-llm/rknpu-driver/include ../../rknn-llm/rknpu-driver/rknpu_temp/ 2>/dev/null
+            NEW_DRIVER_PATH="../../rknn-llm/rknpu-driver/rknpu_temp"
+          else
+            echo "错误：找不到驱动文件"
+            ls -la ../../rknn-llm/rknpu-driver/
+            exit 1
+          fi
+          
+          echo "使用驱动路径: $NEW_DRIVER_PATH"
+          
+          # 备份原有驱动（如果存在）
+          if [ -d drivers/rknpu ]; then
+            cp -r drivers/rknpu drivers/rknpu_backup
+            echo "已备份原有驱动"
+          else
+            echo "没有找到原有驱动，将创建新目录"
+          fi
+          
+          # 删除并替换为新驱动
           rm -rf drivers/rknpu
-          # 3. 复制新驱动
-          cp -rf ../../rknn-llm/rknpu-driver/rknpu_driver_0.9.8/drivers/rknpu drivers/
-          echo "NPU driver replaced."
+          cp -rf $NEW_DRIVER_PATH drivers/rknpu
+          echo "NPU 驱动已替换"
 
       - name: Apply Kernel Patches for Compatibility
         run: |
@@ -52,14 +85,16 @@ jobs:
           # 补丁 1: 注释 rk3588_opp_info 结构体中的问题行
           NPU_DEVFREQ_C="drivers/rknpu/rknpu_devfreq.c"
           if [ -f "$NPU_DEVFREQ_C" ]; then
-            echo "Patching $NPU_DEVFREQ_C"
+            echo "正在修补 $NPU_DEVFREQ_C"
             sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' $NPU_DEVFREQ_C
+          else
+            echo "警告：找不到 $NPU_DEVFREQ_C"
           fi
           
           # 补丁 2: 在 mm.h 中添加缺失的 vm_flags_set/clear 函数
           MM_H="include/linux/mm.h"
           if ! grep -q "vm_flags_set" $MM_H; then
-            echo "Patching $MM_H to add vm_flags helpers"
+            echo "正在修补 $MM_H 添加 vm_flags 辅助函数"
             cat >> $MM_H << 'EOF'
           
           static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
@@ -72,6 +107,8 @@ jobs:
               vma->vm_flags &= ~flags;
           }
           EOF
+          else
+            echo "vm_flags_set 已存在，跳过修补"
           fi
 
       - name: Install Dependencies
@@ -86,10 +123,9 @@ jobs:
           cd kernel-source/${{ env.KERNEL_DIR }}
           # 使用内核自带的默认配置
           make defconfig
-          # 你也可以尝试使用仓库中可能存在的专用配置，例如：
-          # make rockchip_linux_defconfig
-          # 或者直接使用当前目录下已有的 .config 文件
-          # cp .config .config.bak 2>/dev/null || true; make olddefconfig
+          # 可选：启用 NPU 驱动（如果默认未启用）
+          scripts/config --module CONFIG_ROCKCHIP_NPU 2>/dev/null || true
+          scripts/config --set-val CONFIG_ROCKCHIP_NPU y 2>/dev/null || true
 
       - name: Build Kernel and Modules
         run: |
@@ -102,12 +138,23 @@ jobs:
           cd kernel-source/${{ env.KERNEL_DIR }}
           mkdir -p ../output
           # 内核镜像
-          [ -f arch/arm64/boot/Image ] && cp arch/arm64/boot/Image ../output/
+          if [ -f arch/arm64/boot/Image ]; then
+            cp arch/arm64/boot/Image ../output/
+            echo "已复制内核镜像"
+          else
+            echo "警告：找不到内核镜像"
+          fi
           # 设备树文件
-          [ -d arch/arm64/boot/dts/rockchip ] && cp arch/arm64/boot/dts/rockchip/*.dtb ../output/ 2>/dev/null || true
+          if [ -d arch/arm64/boot/dts/rockchip ]; then
+            cp arch/arm64/boot/dts/rockchip/*.dtb ../output/ 2>/dev/null || true
+            echo "已复制设备树文件"
+          fi
           # 内核模块
-          [ -d lib/modules ] && tar -czf ../output/modules.tar.gz lib/modules/ 2>/dev/null || true
-          echo "Artifacts packaged."
+          if [ -d lib/modules ]; then
+            tar -czf ../output/modules.tar.gz lib/modules/ 2>/dev/null || true
+            echo "已打包内核模块"
+          fi
+          echo "编译产物已打包到 ../output/"
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
