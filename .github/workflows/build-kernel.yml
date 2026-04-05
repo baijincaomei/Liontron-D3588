@@ -7,43 +7,73 @@ on:
 env:
   ARCH: arm64
   CROSS_COMPILE: aarch64-linux-gnu-
+  # 选择要编译的内核版本，根据仓库结构，可选: kernel-5.10.198, kernel-6.6.y 等
+  KERNEL_DIR: kernel-5.10.198
 
 jobs:
   build:
     name: Build Kernel
     runs-on: ubuntu-24.04-arm
     steps:
-      # 1. 获取你的 Liontron-D3588 内核源码
       - name: Checkout Kernel Source
         uses: actions/checkout@v4
         with:
           repository: yifengyou/Liontron-D3588
-          path: kernel
+          path: kernel-source
 
-      # 2. 获取 rknn-llm 仓库（包含 NPU 驱动源码）
       - name: Checkout RKNN-LLM for NPU Driver
         uses: actions/checkout@v4
         with:
           repository: airockchip/rknn-llm
           path: rknn-llm
 
-      # 3. 解压 NPU 驱动源码
-      - name: Extract NPU Driver
+      - name: Extract and Prepare NPU Driver
         run: |
           cd rknn-llm/rknpu-driver
           tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
+          # 驱动源码解压后位于 rknpu_driver_0.9.8/drivers/rknpu/
+          ls -la rknpu_driver_0.9.8/drivers/
 
-      # 4. 替换 NPU 驱动到内核源码
-      - name: Replace NPU Driver
+      - name: Replace NPU Driver in Kernel
         run: |
-          cd kernel
-          # 备份原有驱动
-          cp -r drivers/rknpu drivers/rknpu_backup
-          # 删除并替换为新驱动
+          cd kernel-source/${{ env.KERNEL_DIR }}
+          # 1. 备份原有驱动（如果存在）
+          [ -d drivers/rknpu ] && cp -r drivers/rknpu drivers/rknpu_backup
+          # 2. 删除原有驱动
           rm -rf drivers/rknpu
-          cp -rf ../rknn-llm/rknpu-driver/rknpu_driver_0.9.8/drivers/rknpu drivers/
+          # 3. 复制新驱动
+          cp -rf ../../rknn-llm/rknpu-driver/rknpu_driver_0.9.8/drivers/rknpu drivers/
+          echo "NPU driver replaced."
 
-      # 5. 安装编译依赖
+      - name: Apply Kernel Patches for Compatibility
+        run: |
+          cd kernel-source/${{ env.KERNEL_DIR }}
+          
+          # 补丁 1: 注释 rk3588_opp_info 结构体中的问题行
+          NPU_DEVFREQ_C="drivers/rknpu/rknpu_devfreq.c"
+          if [ -f "$NPU_DEVFREQ_C" ]; then
+            echo "Patching $NPU_DEVFREQ_C"
+            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' $NPU_DEVFREQ_C
+          fi
+          
+          # 补丁 2: 在 mm.h 中添加缺失的 vm_flags_set/clear 函数
+          MM_H="include/linux/mm.h"
+          if ! grep -q "vm_flags_set" $MM_H; then
+            echo "Patching $MM_H to add vm_flags helpers"
+            cat >> $MM_H << 'EOF'
+          
+          static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
+          {
+              vma->vm_flags |= flags;
+          }
+          
+          static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
+          {
+              vma->vm_flags &= ~flags;
+          }
+          EOF
+          fi
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -51,36 +81,36 @@ jobs:
             build-essential flex bison bc kmod cpio \
             libssl-dev libelf-dev device-tree-compiler
 
-      # 6. 配置内核（使用你设备的默认配置）
       - name: Configure Kernel
         run: |
-          cd kernel
-          # 假设你的仓库中有设备配置，根据实际情况调整
-          if [ -f arch/arm64/configs/rockchip_linux_defconfig ]; then
-            make rockchip_linux_defconfig
-          else
-            make defconfig
-          fi
+          cd kernel-source/${{ env.KERNEL_DIR }}
+          # 使用内核自带的默认配置
+          make defconfig
+          # 你也可以尝试使用仓库中可能存在的专用配置，例如：
+          # make rockchip_linux_defconfig
+          # 或者直接使用当前目录下已有的 .config 文件
+          # cp .config .config.bak 2>/dev/null || true; make olddefconfig
 
-      # 7. 编译内核
-      - name: Build Kernel
+      - name: Build Kernel and Modules
         run: |
-          cd kernel
+          cd kernel-source/${{ env.KERNEL_DIR }}
           make -j$(nproc)
           make modules -j$(nproc)
 
-      # 8. 打包编译产物
       - name: Package Artifacts
         run: |
-          cd kernel
+          cd kernel-source/${{ env.KERNEL_DIR }}
           mkdir -p ../output
-          cp arch/arm64/boot/Image ../output/
-          cp arch/arm64/boot/dts/rockchip/*.dtb ../output/
-          tar -czf ../output/modules.tar.gz lib/modules/
+          # 内核镜像
+          [ -f arch/arm64/boot/Image ] && cp arch/arm64/boot/Image ../output/
+          # 设备树文件
+          [ -d arch/arm64/boot/dts/rockchip ] && cp arch/arm64/boot/dts/rockchip/*.dtb ../output/ 2>/dev/null || true
+          # 内核模块
+          [ -d lib/modules ] && tar -czf ../output/modules.tar.gz lib/modules/ 2>/dev/null || true
+          echo "Artifacts packaged."
 
-      # 9. 上传编译结果
-      - name: Upload Artifacts
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kernel-with-npu-0.9.8
-          path: output/
+          path: kernel-source/output/
