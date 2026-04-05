@@ -9,71 +9,75 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    # 使用 ubuntu-latest 即可，内置了交叉编译环境或可快速安装
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout your Kernel Source
+      - name: Checkout Liontron Source (Assets)
         uses: actions/checkout@v4
         with:
           repository: baijincaomei/Liontron-D3588
           path: liontron-kernel
 
-      - name: Checkout Rockchip Kernel
+      - name: Checkout Rockchip Kernel (Base)
         uses: actions/checkout@v4
         with:
           repository: rockchip-linux/kernel
           ref: develop-5.10
           path: kernel
 
-      - name: Setup NPU Driver and DTB
-        run: |
-          cd kernel
-          cp ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 .
-          tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
-          if [ -f "drivers/rknpu/rknpu_drv.c" ]; then
-            echo "NPU驱动已就位"
-          else
-            exit 1
-          fi
-          cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
-
-      - name: Apply Patches
-        run: |
-          cd kernel
-          # 只修补 rknpu_devfreq.c，不再修改 mm.h
-          if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
-            echo "修补 rknpu_devfreq.c"
-            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
-          fi
-          echo "补丁已应用"
-
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev libelf-dev device-tree-compiler
+          sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev \
+          libelf-dev device-tree-compiler gcc-aarch64-linux-gnu
 
-      - name: Configure Kernel
+      - name: Integrate NPU Driver and DTS
+        run: |
+          # 1. 处理 NPU 驱动
+          # 假设压缩包内包含 drivers/rknpu 目录结构
+          tar -xvjf liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 -C kernel/
+          
+          # 2. 复制设备树
+          cp liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts kernel/arch/arm64/boot/dts/rockchip/
+          
+          # 3. 修补驱动代码 (解决特定版本的编译冲突)
+          cd kernel
+          if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
+            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
+            echo "Patch applied to rknpu_devfreq.c"
+          fi
+
+      - name: Configure and Build
         run: |
           cd kernel
           make rockchip_linux_defconfig
-          scripts/config --module CONFIG_ROCKCHIP_NPU 2>/dev/null || true
+          
+          # 显式开启 NPU 支持 (y 为内置, m 为模块)
+          scripts/config --enable CONFIG_ROCKCHIP_NPU
+          make olddefconfig
+          
+          # 编译内核、设备树和模块
+          make -j$(nproc) Image dtbs modules
 
-      - name: Build Kernel
+      - name: Prepare Artifacts
         run: |
           cd kernel
-          make -j$(nproc) Image dtbs
-          make modules -j$(nproc)
-
-      - name: Package Artifacts
-        run: |
-          cd kernel
-          mkdir -p output
+          mkdir -p output/modules
+          
+          # 复制核心镜像
           cp arch/arm64/boot/Image output/
           cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
-          tar -czf output/modules.tar.gz lib/modules/ 2>/dev/null || true
-          echo "编译产物已打包"
+          
+          # 正确安装并打包模块
+          make modules_install INSTALL_MOD_PATH=./output/modules
+          cd output
+          tar -czf modules.tar.gz modules/
+          rm -rf modules/
+          
+          echo "Build completed successfully."
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: liontron-kernel-with-npu-0.9.8
+          name: liontron-kernel-RK3588-NPU0.9.8
           path: kernel/output/
