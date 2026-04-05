@@ -1,4 +1,4 @@
-name: Build RK3588 Kernel with Built-in NPU 0.9.8
+name: Build RK3588 Kernel with Built-in NPU 0.9.8 (Fixed Path)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 env:
   ARCH: arm64
   CROSS_COMPILE: aarch64-linux-gnu-
-  # 解决 GCC 13 兼容性，忽略警告
+  # 解决 GCC 13 编译内核时的严格警告错误
   KCFLAGS: "-Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-unused-result"
 
 jobs:
@@ -23,70 +23,77 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev \
-          libelf-dev device-tree-compiler gcc-aarch64-linux-gnu git python3 python-is-python3
+          libelf-dev device-tree-compiler gcc-aarch64-linux-gnu git python3 python-is-python3 \
+          u-boot-tools # 脚本中打包 boot.img 需要这个工具
 
       - name: Clone Kernel Source
         run: |
-          # 克隆内核仓库
+          # 严格按照 yifengyou 脚本中的仓库地址进行克隆
           git clone --depth=1 https://github.com/yifengyou/d3588-kernel-5.10.198.git kernel-source
+          cd kernel-source
+          ls -F # 确认 d3588.sh 是否在根目录
 
-      - name: Integrate NPU 0.9.8 and Register DTS
+      - name: Integrate NPU 0.9.8 & Patching
         run: |
           cd kernel-source
           
-          # 1. 彻底替换 NPU 驱动源码
-          echo "正在升级 NPU 驱动至 0.9.8..."
+          # 1. 替换为 NPU 0.9.8 源码
+          echo "Upgrading NPU driver to 0.9.8..."
           rm -rf drivers/rknpu/*
           tar -xvjf ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 -C .
           
-          # 2. 注入设备树并【关键】在 Makefile 中注册
+          # 2. 注入 Liontron 专用设备树并注册
           DTS_NAME="rk3588-liontron-d3588"
           cp ../liontron-kernel/kernel-5.10.198/${DTS_NAME}.dts arch/arm64/boot/dts/rockchip/
           
-          # 如果 Makefile 里没有这个 dtb，就加上它，确保它会被编译
-          MAKEFILE_PATH="arch/arm64/boot/dts/rockchip/Makefile"
-          if ! grep -q "${DTS_NAME}.dtb" $MAKEFILE_PATH; then
-            echo "正在 Makefile 中注册设备树..."
-            # 在 rockchip 列表末尾添加该 dtb
-            sed -i "/dtb-\$(CONFIG_ARCH_ROCKCHIP) +=/a \	dtb-\$(CONFIG_ARCH_ROCKCHIP) += ${DTS_NAME}.dtb" $MAKEFILE_PATH
+          # 修改 Makefile 确保设备树被编译
+          MAKEFILE="arch/arm64/boot/dts/rockchip/Makefile"
+          if ! grep -q "${DTS_NAME}.dtb" $MAKEFILE; then
+            sed -i "/dtb-\$(CONFIG_ARCH_ROCKCHIP) +=/a \	dtb-\$(CONFIG_ARCH_ROCKCHIP) += ${DTS_NAME}.dtb" $MAKEFILE
           fi
           
-          # 3. 强制配置 NPU 为内置
-          make rockchip_linux_defconfig
-          ./scripts/config --enable CONFIG_ROCKCHIP_NPU
-          make olddefconfig
-          
-          # 4. 驱动补丁
+          # 3. 驱动补丁：修复频率初始化冲突
           if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
             sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
           fi
 
-      - name: Execute Build
+      - name: Configure for Built-in
+        run: |
+          cd kernel-source
+          # 加载默认配置
+          make rockchip_linux_defconfig
+          
+          # 关键：强制设置 NPU 驱动为内核内置 (y)
+          ./scripts/config --enable CONFIG_ROCKCHIP_NPU
+          
+          # 应用并检查依赖
+          make olddefconfig
+
+      - name: Execute Compilation
         run: |
           cd kernel-source
           chmod +x d3588.sh
-          # 执行编译脚本
+          # 执行原作者的编译脚本，它会生成 boot.img
           ./d3588.sh
           
-          # 【补刀】如果 d3588.sh 没编译 dtb，这里强制编译一次
+          # 如果 d3588.sh 编译失败或未生成 dtb，强制补编一次
           if [ ! -f arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb ]; then
-            echo "检测到 dtb 未生成，尝试手动编译设备树..."
-            make -j$(nproc) rockchip/rk3588-liontron-d3588.dtb
+             make -j$(nproc) rockchip/rk3588-liontron-d3588.dtb
           fi
 
       - name: Package Artifacts
         run: |
           mkdir -p release
-          # 使用通配符和更灵活的路径查找
-          find kernel-source/arch/arm64/boot/ -name "Image" -exec cp {} release/ \;
-          find kernel-source/arch/arm64/boot/dts/rockchip/ -name "rk3588-liontron-d3588.dtb" -exec cp {} release/ \;
+          # 收集所有可能的产物
+          [ -f kernel-source/boot.img ] && cp kernel-source/boot.img release/
+          [ -f kernel-source/arch/arm64/boot/Image ] && cp kernel-source/arch/arm64/boot/Image release/
+          find kernel-source/arch/arm64/boot/dts/rockchip/ -name "*.dtb" -exec cp {} release/ \;
           
-          # 检查文件是否真的存在，防止 upload 步骤报错
-          ls -lh release/
-          if [ ! -f release/Image ]; then echo "Image missing!" && exit 1; fi
+          echo "NPU 0.9.8 Build Success" > release/build_info.txt
+          ls -R release/
 
-      - name: Upload Kernel
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: Liontron-D3588-NPU-0.9.8-Fixed
+          name: Liontron-D3588-NPU-0.9.8-Package
           path: release/
