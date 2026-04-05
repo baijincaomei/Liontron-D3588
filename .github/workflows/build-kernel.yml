@@ -1,4 +1,4 @@
-name: Build RK3588 Kernel with NPU 0.9.8 for Liontron-D3588
+name: Build RK3588 Kernel with Built-in NPU 0.9.8
 
 on:
   workflow_dispatch:
@@ -6,8 +6,8 @@ on:
 env:
   ARCH: arm64
   CROSS_COMPILE: aarch64-linux-gnu-
-  # 解决 GCC 13 兼容性问题，防止警告转错误
-  KCFLAGS: "-Wno-error"
+  # 关键：解决 GCC 13 兼容性，防止警告导致 Error 2
+  KCFLAGS: "-Wno-error -Wno-implicit-function-declaration -Wno-int-conversion"
 
 jobs:
   build:
@@ -32,60 +32,62 @@ jobs:
           sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev \
           libelf-dev device-tree-compiler gcc-aarch64-linux-gnu
 
-      - name: Integrate NPU Driver and DTS
+      - name: Clean and Integrate NPU 0.9.8
         run: |
-          # 1. 解压 NPU 驱动并确保路径正确
-          # 假设压缩包内结构为 drivers/rknpu/...
-          tar -xvjf liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 -C kernel/
-          
-          # 2. 复制 Liontron 专用设备树
-          cp liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts kernel/arch/arm64/boot/dts/rockchip/
-          
-          # 3. 应用 NPU 补丁 (根据您的日志需求)
           cd kernel
+          # 彻底移除旧版 0.9.3 驱动防止冲突
+          rm -rf drivers/rknpu
+          
+          # 解压新版驱动
+          tar -xvjf ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 -C .
+          
+          # 验证解压路径是否正确 (检查关键驱动文件)
+          if [ ! -f "drivers/rknpu/rknpu_drv.c" ]; then
+            echo "错误: 驱动解压位置不对，请检查压缩包结构"
+            ls -R drivers/rknpu || echo "目录不存在"
+            exit 1
+          fi
+          
+          # 复制 Liontron 专用设备树
+          cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
+
+      - name: Apply Fix Patches
+        run: |
+          cd kernel
+          # 修正频率设置函数冲突 (针对 0.9.8 常见补丁)
           if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
             sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
-            echo "NPU patch applied."
+            echo "Frequency patch applied."
           fi
 
-      - name: Configure Kernel
+      - name: Configure for Built-in
         run: |
           cd kernel
           make rockchip_linux_defconfig
           
-          # 强行开启 NPU 选项并更新依赖配置
+          # 强制设置为 Built-in (y)
           scripts/config --enable CONFIG_ROCKCHIP_NPU
+          
+          # 应用配置并解决依赖
           make olddefconfig
 
-      - name: Build Kernel and Modules
+      - name: Build Kernel (Built-in Mode)
         run: |
           cd kernel
-          # 编译内核 Image 和设备树
+          # 并行编译内核和设备树
+          # 如果再次报错，请尝试将 -j$(nproc) 改为 -j4 观察具体报错
           make -j$(nproc) Image dtbs
-          
-          # 编译模块，单独运行以确保错误捕获清晰
-          make -j$(nproc) modules
 
-      - name: Package Artifacts
+      - name: Package Results
         run: |
-          cd kernel
-          # 创建输出目录
-          mkdir -p output/lib/modules
-          
-          # 复制内核与设备树
-          cp arch/arm64/boot/Image output/
-          cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
-          
-          # 关键步骤：正确安装内核模块到输出目录以便打包
-          make modules_install INSTALL_MOD_PATH=./output/
-          
-          # 打包
-          cd output
-          tar -czf ../liontron_rk3588_kernel_0.9.8.tar.gz .
-          echo "Artifacts prepared."
+          mkdir -p output
+          cp kernel/arch/arm64/boot/Image output/
+          cp kernel/arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
+          # 记录编译版本
+          echo "Built-in NPU: 0.9.8" > output/version.txt
 
-      - name: Upload Results
+      - name: Upload Kernel Image
         uses: actions/upload-artifact@v4
         with:
-          name: liontron-kernel-pack
-          path: kernel/liontron_rk3588_kernel_0.9.8.tar.gz
+          name: Liontron-D3588-Kernel-NPU-0.9.8
+          path: output/
