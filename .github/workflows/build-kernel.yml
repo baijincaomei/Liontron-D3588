@@ -1,55 +1,17 @@
-name: Build RK3588 Kernel with NPU 0.9.8 for Liontron-D3588
-
-on:
-  workflow_dispatch:
-
-env:
-  ARCH: arm64
-  CROSS_COMPILE: aarch64-linux-gnu-
-
-jobs:
-  build:
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - name: Checkout your Kernel Source
-        uses: actions/checkout@v4
-        with:
-          repository: baijincaomei/Liontron-D3588
-          path: liontron-kernel
-
-      - name: Checkout Rockchip Kernel
-        uses: actions/checkout@v4
-        with:
-          repository: rockchip-linux/kernel
-          ref: develop-5.10
-          path: kernel
-
-      - name: Setup NPU Driver and DTB
-        run: |
-          cd kernel
-          # 解压驱动（解压后直接得到 drivers/ 目录）
-          cp ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 .
-          tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
-          
-          # 验证驱动已就位
-          if [ -f "drivers/rknpu/rknpu_drv.c" ]; then
-            echo "✅ NPU 驱动已就位"
-          else
-            echo "❌ 驱动安装失败"
-            exit 1
-          fi
-          
-          # 复制设备树
-          cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
-          echo "✅ 设备树已就位"
-
       - name: Apply Patches
         run: |
           cd kernel
-          # 修补 rknpu_devfreq.c
-          sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
-          # 修补 mm.h
+          
+          # 补丁1: 注释 rknpu_devfreq.c 中的问题行
+          if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
+            echo "修补 rknpu_devfreq.c"
+            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
+          fi
+          
+          # 补丁2: 只有当函数不存在时才添加（避免重复定义）
+          echo "检查 mm.h 中的 vm_flags_set..."
           if ! grep -q "vm_flags_set" include/linux/mm.h; then
+            echo "添加 vm_flags_set 和 vm_flags_clear"
             cat >> include/linux/mm.h << 'EOF'
           
           static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
@@ -62,37 +24,8 @@ jobs:
               vma->vm_flags &= ~flags;
           }
           EOF
+          else
+            echo "vm_flags_set 已存在，跳过添加"
           fi
+          
           echo "✅ 补丁已应用"
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev libelf-dev device-tree-compiler
-
-      - name: Configure Kernel
-        run: |
-          cd kernel
-          make rockchip_linux_defconfig
-          scripts/config --module CONFIG_ROCKCHIP_NPU 2>/dev/null || true
-
-      - name: Build Kernel
-        run: |
-          cd kernel
-          make -j$(nproc) Image dtbs
-          make modules -j$(nproc)
-
-      - name: Package Artifacts
-        run: |
-          cd kernel
-          mkdir -p output
-          cp arch/arm64/boot/Image output/
-          cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
-          tar -czf output/modules.tar.gz lib/modules/ 2>/dev/null || true
-          echo "✅ 编译产物已打包"
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: liontron-kernel-with-npu-0.9.8
-          path: kernel/output/
