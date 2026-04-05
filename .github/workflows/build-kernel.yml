@@ -24,39 +24,30 @@ jobs:
           ref: develop-5.10
           path: kernel
 
-      - name: Replace NPU Driver
+      - name: Setup NPU Driver and DTB
         run: |
           cd kernel
-          # 解压驱动
+          # 解压驱动（解压后直接得到 drivers/ 目录）
           cp ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 .
           tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
           
-          # 删除旧的 drivers/rknpu
-          rm -rf drivers/rknpu
-          
-          # 复制新的驱动（根据解压结果选择路径）
-          if [ -d "rknpu_driver_0.9.8/drivers/rknpu" ]; then
-            cp -rf rknpu_driver_0.9.8/drivers/rknpu drivers/
-          elif [ -d "drivers/rknpu" ]; then
-            # 已经在了，什么都不做
-            echo "驱动已就位"
+          # 验证驱动已就位
+          if [ -f "drivers/rknpu/rknpu_drv.c" ]; then
+            echo "✅ NPU 驱动已就位"
           else
-            echo "错误：找不到驱动"
+            echo "❌ 驱动安装失败"
             exit 1
           fi
           
-          ls -la drivers/rknpu/
-          
           # 复制设备树
           cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
+          echo "✅ 设备树已就位"
 
       - name: Apply Patches
         run: |
           cd kernel
-          # 修补 devfreq.c
-          if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
-            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
-          fi
+          # 修补 rknpu_devfreq.c
+          sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
           # 修补 mm.h
           if ! grep -q "vm_flags_set" include/linux/mm.h; then
             cat >> include/linux/mm.h << 'EOF'
@@ -72,6 +63,7 @@ jobs:
           }
           EOF
           fi
+          echo "✅ 补丁已应用"
 
       - name: Install Dependencies
         run: |
@@ -84,21 +76,22 @@ jobs:
           make rockchip_linux_defconfig
           scripts/config --module CONFIG_ROCKCHIP_NPU 2>/dev/null || true
 
-      - name: Build
+      - name: Build Kernel
         run: |
           cd kernel
           make -j$(nproc) Image dtbs
           make modules -j$(nproc)
 
-      - name: Package
+      - name: Package Artifacts
         run: |
           cd kernel
           mkdir -p output
           cp arch/arm64/boot/Image output/
           cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
           tar -czf output/modules.tar.gz lib/modules/ 2>/dev/null || true
+          echo "✅ 编译产物已打包"
 
-      - name: Upload
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: liontron-kernel-with-npu-0.9.8
