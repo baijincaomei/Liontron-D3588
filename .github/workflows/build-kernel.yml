@@ -1,4 +1,4 @@
-name: Build RK3588 Kernel with Built-in NPU 0.9.8 (Fixed Path)
+name: Build RK3588 Kernel with Built-in NPU 0.9.8
 
 on:
   workflow_dispatch:
@@ -6,94 +6,77 @@ on:
 env:
   ARCH: arm64
   CROSS_COMPILE: aarch64-linux-gnu-
-  # 解决 GCC 13 编译内核时的严格警告错误
+  # 解决 GCC 13 报错的关键环境变量
   KCFLAGS: "-Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-unused-result"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout Liontron Assets
+      - name: Checkout Assets (Contains d3588.sh and Driver)
         uses: actions/checkout@v4
         with:
           repository: baijincaomei/Liontron-D3588
-          path: liontron-kernel
+          path: liontron-assets  # 对应原脚本中的基础资源目录
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev \
-          libelf-dev device-tree-compiler gcc-aarch64-linux-gnu git python3 python-is-python3 \
-          u-boot-tools # 脚本中打包 boot.img 需要这个工具
+          libelf-dev device-tree-compiler gcc-aarch64-linux-gnu git python3 u-boot-tools
 
       - name: Clone Kernel Source
         run: |
-          # 严格按照 yifengyou 脚本中的仓库地址进行克隆
-          git clone --depth=1 https://github.com/yifengyou/d3588-kernel-5.10.198.git kernel-source
-          cd kernel-source
-          ls -F # 确认 d3588.sh 是否在根目录
-
-      - name: Integrate NPU 0.9.8 & Patching
+          # 按照原脚本逻辑克隆内核
+          git clone --depth=1 https://github.com/yifengyou/d3588-kernel-5.10.198.git kernel
+          
+      - name: Integrate NPU 0.9.8 & Setup Build Script
         run: |
-          cd kernel-source
+          # 1. 替换 NPU 驱动
+          echo "Upgrading NPU to 0.9.8..."
+          rm -rf kernel/drivers/rknpu/*
+          tar -xvjf liontron-assets/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 -C kernel/
           
-          # 1. 替换为 NPU 0.9.8 源码
-          echo "Upgrading NPU driver to 0.9.8..."
-          rm -rf drivers/rknpu/*
-          tar -xvjf ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 -C .
-          
-          # 2. 注入 Liontron 专用设备树并注册
-          DTS_NAME="rk3588-liontron-d3588"
-          cp ../liontron-kernel/kernel-5.10.198/${DTS_NAME}.dts arch/arm64/boot/dts/rockchip/
-          
-          # 修改 Makefile 确保设备树被编译
-          MAKEFILE="arch/arm64/boot/dts/rockchip/Makefile"
-          if ! grep -q "${DTS_NAME}.dtb" $MAKEFILE; then
-            sed -i "/dtb-\$(CONFIG_ARCH_ROCKCHIP) +=/a \	dtb-\$(CONFIG_ARCH_ROCKCHIP) += ${DTS_NAME}.dtb" $MAKEFILE
+          # 2. 注入设备树并注册 Makefile
+          cp liontron-assets/kernel-5.10.198/rk3588-liontron-d3588.dts kernel/arch/arm64/boot/dts/rockchip/
+          if ! grep -q "rk3588-liontron-d3588.dtb" kernel/arch/arm64/boot/dts/rockchip/Makefile; then
+            sed -i "/dtb-\$(CONFIG_ARCH_ROCKCHIP) +=/a \	dtb-\$(CONFIG_ARCH_ROCKCHIP) += rk3588-liontron-d3588.dtb" kernel/arch/arm64/boot/dts/rockchip/Makefile
           fi
+
+          # 3. 准备编译脚本 (核心修复：从资源目录复制 d3588.sh 到内核目录)
+          # 根据你提供的链接，d3588.sh 应该在 liontron-assets 的相关路径下
+          # 如果资源包里已经有这个脚本，我们把它拷贝进去
+          cp liontron-assets/kernel-5.10.198/d3588.sh kernel/ || echo "d3588.sh already in repo or missing in assets"
           
-          # 3. 驱动补丁：修复频率初始化冲突
+          # 4. 强制配置 NPU 为内置
+          cd kernel
+          make rockchip_linux_defconfig
+          ./scripts/config --enable CONFIG_ROCKCHIP_NPU
+          make olddefconfig
+          
+          # 5. 修复代码兼容性补丁
           if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
             sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
           fi
 
-      - name: Configure for Built-in
+      - name: Execute Kernel Build
         run: |
-          cd kernel-source
-          # 加载默认配置
-          make rockchip_linux_defconfig
-          
-          # 关键：强制设置 NPU 驱动为内核内置 (y)
-          ./scripts/config --enable CONFIG_ROCKCHIP_NPU
-          
-          # 应用并检查依赖
-          make olddefconfig
-
-      - name: Execute Compilation
-        run: |
-          cd kernel-source
+          cd kernel
+          # 再次确认脚本权限并运行
           chmod +x d3588.sh
-          # 执行原作者的编译脚本，它会生成 boot.img
           ./d3588.sh
-          
-          # 如果 d3588.sh 编译失败或未生成 dtb，强制补编一次
-          if [ ! -f arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb ]; then
-             make -j$(nproc) rockchip/rk3588-liontron-d3588.dtb
-          fi
 
-      - name: Package Artifacts
+      - name: Package Results
         run: |
           mkdir -p release
-          # 收集所有可能的产物
-          [ -f kernel-source/boot.img ] && cp kernel-source/boot.img release/
-          [ -f kernel-source/arch/arm64/boot/Image ] && cp kernel-source/arch/arm64/boot/Image release/
-          find kernel-source/arch/arm64/boot/dts/rockchip/ -name "*.dtb" -exec cp {} release/ \;
-          
-          echo "NPU 0.9.8 Build Success" > release/build_info.txt
-          ls -R release/
+          # 提取 Image, DTB 和编译出的 boot.img
+          find kernel/arch/arm64/boot/ -name "Image" -exec cp {} release/ \;
+          find kernel/arch/arm64/boot/dts/rockchip/ -name "rk3588-liontron-d3588.dtb" -exec cp {} release/ \;
+          [ -f kernel/boot.img ] && cp kernel/boot.img release/
+          ls -lh release/
 
-      - name: Upload Results
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Liontron-D3588-NPU-0.9.8-Package
+          name: Liontron-D3588-NPU0.9.8-BuiltIn
           path: release/
