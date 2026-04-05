@@ -1,110 +1,35 @@
-# .github/workflows/build-kernel.yml
-name: Build RK3588 Kernel with NPU 0.9.8 for Liontron-D3588
-
-on:
-  workflow_dispatch:
-
-env:
-  ARCH: arm64
-  CROSS_COMPILE: aarch64-linux-gnu-
-
-jobs:
-  build:
-    runs-on: ubuntu-24.04-arm
-    steps:
-      # 1. 获取你的内核仓库（包含源码、驱动包、专属dts）
-      - name: Checkout your Kernel Source
-        uses: actions/checkout@v4
-        with:
-          repository: baijincaomei/Liontron-D3588
-          path: liontron-kernel
-
-      # 2. 使用 Rockchip 官方内核源码（5.10 版本）作为编译基础
-      - name: Checkout Rockchip Kernel
-        uses: actions/checkout@v4
-        with:
-          repository: rockchip-linux/kernel
-          ref: develop-5.10
-          path: kernel
-
-      # 3. 从你的仓库中提取 NPU 驱动和设备树文件
       - name: Extract NPU Driver and DTB
         run: |
           cd kernel
-          # 解压 NPU 驱动
+          # 复制并解压驱动包
           cp ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 .
           tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
           
-          # 替换 NPU 驱动
-          cp -r drivers/rknpu drivers/rknpu_backup
-          rm -rf drivers/rknpu
-          cp -rf rknpu_driver_0.9.8/drivers/rknpu drivers/
+          # 显示解压后的内容，帮助调试
+          echo "=== 解压后的目录内容 ==="
+          ls -la
           
-          # 复制你的专属设备树源码到正确位置
-          cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
-          echo "已准备 NPU 驱动和专属设备树文件"
-
-      # 4. 应用必要的补丁
-      - name: Apply Kernel Patches
-        run: |
-          cd kernel
-          # 补丁1: 注释 rknpu_devfreq.c 中的问题行
-          sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
-          # 补丁2: 在 mm.h 中添加缺失的 vm_flags 函数
-          if ! grep -q "vm_flags_set" include/linux/mm.h; then
-            cat >> include/linux/mm.h << 'EOF'
-          
-          static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
-          {
-              vma->vm_flags |= flags;
-          }
-          
-          static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
-          {
-              vma->vm_flags &= ~flags;
-          }
-          EOF
+          # 智能查找驱动源目录
+          if [ -d "rknpu_driver_0.9.8/drivers/rknpu" ]; then
+            DRIVER_SRC="rknpu_driver_0.9.8/drivers/rknpu"
+          elif [ -d "drivers/rknpu" ]; then
+            DRIVER_SRC="drivers/rknpu"
+          else
+            echo "错误：找不到驱动源码目录"
+            exit 1
           fi
-          echo "内核补丁已应用"
-
-      # 5. 安装编译依赖
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison bc kmod cpio libssl-dev libelf-dev device-tree-compiler
-
-      # 6. 配置内核（使用 rockchip 默认配置）
-      - name: Configure Kernel
-        run: |
-          cd kernel
-          make rockchip_linux_defconfig
-          # 确保 NPU 驱动被编译
-          scripts/config --module CONFIG_ROCKCHIP_NPU
-
-      # 7. 编译内核和设备树
-      - name: Build Kernel and DTB
-        run: |
-          cd kernel
-          # 编译内核镜像和设备树
-          make -j$(nproc) Image dtbs
-          # 编译内核模块
-          make modules -j$(nproc)
-
-      # 8. 打包编译产物
-      - name: Package Artifacts
-        run: |
-          cd kernel
-          mkdir -p output
-          # 复制内核镜像
-          cp arch/arm64/boot/Image output/
-          # 复制你专属的设备树文件（重要！）
-          cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
-          # 打包内核模块
-          tar -czf output/modules.tar.gz lib/modules/ 2>/dev/null || true
-          echo "编译产物已打包到 output/ 目录"
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: liontron-kernel-with-npu-0.9.8
-          path: kernel/output/
+          
+          echo "使用驱动源目录: $DRIVER_SRC"
+          
+          # 备份原有驱动
+          cp -r drivers/rknpu drivers/rknpu_backup
+          # 删除并替换为新驱动
+          rm -rf drivers/rknpu
+          cp -rf $DRIVER_SRC drivers/
+          
+          echo "NPU 驱动替换完成"
+          ls -la drivers/rknpu/
+          
+          # 复制你的专属设备树文件
+          cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
+          echo "已准备专属设备树文件"
