@@ -29,47 +29,22 @@ jobs:
           cd kernel
           cp ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 .
           tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
-          
           if [ -f "drivers/rknpu/rknpu_drv.c" ]; then
-            echo "✅ NPU 驱动已就位"
+            echo "NPU驱动已就位"
           else
-            echo "❌ 驱动安装失败"
             exit 1
           fi
-          
           cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
-          echo "✅ 设备树已就位"
 
       - name: Apply Patches
         run: |
           cd kernel
-          
-          # 修补 rknpu_devfreq.c
+          # 只修补 rknpu_devfreq.c，不再修改 mm.h
           if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
             echo "修补 rknpu_devfreq.c"
             sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
           fi
-          
-          # 只有当函数不存在时才添加
-          if ! grep -q "vm_flags_set" include/linux/mm.h; then
-            echo "添加 vm_flags_set 和 vm_flags_clear"
-            cat >> include/linux/mm.h << 'EOF'
-          
-          static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
-          {
-              vma->vm_flags |= flags;
-          }
-          
-          static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
-          {
-              vma->vm_flags &= ~flags;
-          }
-          EOF
-          else
-            echo "vm_flags_set 已存在，跳过添加"
-          fi
-          
-          echo "✅ 补丁已应用"
+          echo "补丁已应用"
 
       - name: Install Dependencies
         run: |
@@ -95,7 +70,7 @@ jobs:
           cp arch/arm64/boot/Image output/
           cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
           tar -czf output/modules.tar.gz lib/modules/ 2>/dev/null || true
-          echo "✅ 编译产物已打包"
+          echo "编译产物已打包"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
