@@ -24,58 +24,38 @@ jobs:
           ref: develop-5.10
           path: kernel
 
-      - name: Extract NPU Driver and DTB
+      - name: Replace NPU Driver
         run: |
           cd kernel
-          
-          # 查找官方内核中 NPU 驱动的实际位置
-          echo "=== 查找官方 NPU 驱动位置 ==="
-          find drivers/ -name "rknpu_drv.c" 2>/dev/null || echo "未找到 rknpu_drv.c"
-          find drivers/ -type d -name "*npu*" 2>/dev/null
-          
-          # 复制并解压驱动包
+          # 解压驱动
           cp ../liontron-kernel/kernel-5.10.198/rknpu_driver_0.9.8_20241009.tar.bz2 .
           tar -xvjf rknpu_driver_0.9.8_20241009.tar.bz2
           
-          # 确定新驱动的源目录
-          if [ -d "drivers/rknpu" ]; then
-            NEW_DRIVER="drivers/rknpu"
+          # 删除旧的 drivers/rknpu
+          rm -rf drivers/rknpu
+          
+          # 复制新的驱动（根据解压结果选择路径）
+          if [ -d "rknpu_driver_0.9.8/drivers/rknpu" ]; then
+            cp -rf rknpu_driver_0.9.8/drivers/rknpu drivers/
+          elif [ -d "drivers/rknpu" ]; then
+            # 已经在了，什么都不做
+            echo "驱动已就位"
           else
-            NEW_DRIVER="rknpu_driver_0.9.8/drivers/rknpu"
+            echo "错误：找不到驱动"
+            exit 1
           fi
           
-          # 确定官方内核的目标目录
-          if [ -d "drivers/rknpu" ]; then
-            TARGET_DIR="drivers/rknpu"
-          elif [ -d "drivers/rockchip/npu" ]; then
-            TARGET_DIR="drivers/rockchip/npu"
-          else
-            # 如果都不存在，创建一个
-            echo "创建 drivers/rknpu 目录"
-            mkdir -p drivers/rknpu
-            TARGET_DIR="drivers/rknpu"
-          fi
+          ls -la drivers/rknpu/
           
-          echo "新驱动源: $NEW_DRIVER"
-          echo "目标目录: $TARGET_DIR"
-          
-          # 备份并替换
-          [ -d "$TARGET_DIR" ] && cp -r $TARGET_DIR ${TARGET_DIR}_backup
-          rm -rf $TARGET_DIR
-          cp -rf $NEW_DRIVER $TARGET_DIR
-          
-          ls -la $TARGET_DIR
-          
-          # 复制设备树文件
+          # 复制设备树
           cp ../liontron-kernel/kernel-5.10.198/rk3588-liontron-d3588.dts arch/arm64/boot/dts/rockchip/
 
-      - name: Apply Kernel Patches
+      - name: Apply Patches
         run: |
           cd kernel
-          # 找到并修补 rknpu_devfreq.c
-          NPU_FILE=$(find drivers/ -name "rknpu_devfreq.c" | head -1)
-          if [ -n "$NPU_FILE" ]; then
-            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' $NPU_FILE
+          # 修补 devfreq.c
+          if [ -f drivers/rknpu/rknpu_devfreq.c ]; then
+            sed -i '/\.set_soc_info = rockchip_opp_set_low_length,/s/^/\/\/ /' drivers/rknpu/rknpu_devfreq.c
           fi
           # 修补 mm.h
           if ! grep -q "vm_flags_set" include/linux/mm.h; then
@@ -104,13 +84,13 @@ jobs:
           make rockchip_linux_defconfig
           scripts/config --module CONFIG_ROCKCHIP_NPU 2>/dev/null || true
 
-      - name: Build Kernel and DTB
+      - name: Build
         run: |
           cd kernel
           make -j$(nproc) Image dtbs
           make modules -j$(nproc)
 
-      - name: Package Artifacts
+      - name: Package
         run: |
           cd kernel
           mkdir -p output
@@ -118,7 +98,7 @@ jobs:
           cp arch/arm64/boot/dts/rockchip/rk3588-liontron-d3588.dtb output/
           tar -czf output/modules.tar.gz lib/modules/ 2>/dev/null || true
 
-      - name: Upload Artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: liontron-kernel-with-npu-0.9.8
